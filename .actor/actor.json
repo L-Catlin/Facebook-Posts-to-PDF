@@ -1,0 +1,10 @@
+{
+  "actorSpecification": 1,
+  "name": "facebook-posts-to-pdf",
+  "title": "Facebook Posts to PDF",
+  "description": "Automates Facebook scraping, screenshots, and PDF generation.",
+  "version": "0.1",
+  "buildTag": "latest",
+  "input": "./input_schema.json",
+  "dockerfile": "../Dockerfile"
+}
