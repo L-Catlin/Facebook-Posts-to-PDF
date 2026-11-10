@@ -1,0 +1,66 @@
+{
+  "title": "Facebook Posts to PDF",
+  "description": "Scrape Facebook posts, capture screenshots, and merge them into one PDF.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "facebookProfileUrl": {
+      "title": "Facebook Profile URL",
+      "type": "string",
+      "description": "The Facebook profile URL whose posts you want to capture.",
+      "editor": "textfield"
+    },
+    "resultsLimit": {
+      "title": "Maximum Posts",
+      "type": "integer",
+      "description": "Maximum number of Facebook posts to retrieve.",
+      "default": 20,
+      "minimum": 1
+    },
+    
+    "onlyPostsNewerThan": {
+      "title": "Only Posts Newer Than",
+      "type": "string",
+      "description": "Only retrieve posts newer than this date. Use YYYY-MM-DD, such as 2026-01-01.",
+      "editor": "textfield",
+      "default": "2025-12-31",
+      "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$"
+}
+,
+    "viewportWidth": {
+      "title": "Screenshot Width",
+      "type": "integer",
+      "description": "Width of the browser viewport used to capture each Facebook post, in pixels.",
+      "default": 800,
+      "minimum": 1
+    },
+    "viewportHeight": {
+      "title": "Screenshot Height",
+      "type": "integer",
+      "description": "Height of the browser viewport used to capture each Facebook post, in pixels.",
+      "default": 1280,
+      "minimum": 1
+    },
+    "maxImageHeight": {
+      "title": "Maximum Image Height",
+      "type": "integer",
+      "description": "Maximum screenshot height in pixels before cropping. Set to 0 to disable cropping.",
+      "default": 1400,
+      "minimum": 0
+    },
+    "pageSize": {
+      "title": "PDF Page Size",
+      "type": "string",
+      "description": "Page size used for the final PDF document.",
+      "enum": [
+        "LETTER",
+        "A4"
+      ],
+      "default": "LETTER",
+      "editor": "select"
+    }
+  },
+  "required": [
+    "facebookProfileUrl"
+  ]
+}
