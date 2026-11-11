@@ -1,63 +1,67 @@
 {
-  "title": "Facebook Posts to PDF",
-  "description": "Scrape Facebook posts, capture screenshots, and merge them into one PDF.",
+  "title": "Facebook Posts to PDF Workflow",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "facebookProfileUrl": {
       "title": "Facebook Profile URL",
       "type": "string",
-      "description": "The Facebook profile URL whose posts you want to capture.",
+      "description": "Facebook profile to archive.",
       "editor": "textfield"
     },
     "resultsLimit": {
-      "title": "Maximum Posts",
+      "title": "Maximum posts",
       "type": "integer",
-      "description": "Maximum number of Facebook posts to retrieve.",
+      "description": "Maximum posts requested from the Posts Scraper.",
       "default": 20,
       "minimum": 1
     },
-    
+    "photosResultsLimit": {
+      "title": "Maximum photos (entire run)",
+      "type": "integer",
+      "description": "Global maximum number of photo records returned by one Photos Scraper run across all posts; not a per-post limit.",
+      "default": 100,
+      "minimum": 1
+    },
     "onlyPostsNewerThan": {
       "title": "Only Posts Newer Than",
       "type": "string",
-      "description": "Only retrieve posts newer than this date. Use YYYY-MM-DD, such as 2026-01-01.",
+      "description": "Posts newer than YYYY-MM-DD.",
       "editor": "textfield",
       "default": "2025-12-31",
       "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$"
-}
-,
+    },
     "viewportWidth": {
-      "title": "Screenshot Width",
+      "title": "Viewport width",
       "type": "integer",
-      "description": "Width of the browser viewport used to capture each Facebook post, in pixels.",
+      "description": "Screenshot viewport width in pixels.",
       "default": 800,
       "minimum": 1
     },
     "viewportHeight": {
-      "title": "Screenshot Height",
+      "title": "Viewport height",
       "type": "integer",
-      "description": "Height of the browser viewport used to capture each Facebook post, in pixels.",
+      "description": "Screenshot viewport height in pixels.",
       "default": 1280,
       "minimum": 1
     },
     "maxImageHeight": {
-      "title": "Maximum Image Height",
+      "title": "Maximum image height",
       "type": "integer",
-      "description": "Maximum screenshot height in pixels before cropping. Set to 0 to disable cropping.",
+      "description": "Maximum screenshot raster height before PDF fitting; zero disables resizing.",
       "default": 1400,
       "minimum": 0
     },
     "pageSize": {
-      "title": "PDF Page Size",
+      "title": "PDF page size",
       "type": "string",
-      "description": "Page size used for the final PDF document.",
+      "description": "Paper size.",
+      "editor": "select",
       "enum": [
         "LETTER",
         "A4"
       ],
-      "default": "LETTER",
-      "editor": "select"
+      "default": "LETTER"
     }
   },
   "required": [
