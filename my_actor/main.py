@@ -1,56 +1,39 @@
+"""Facebook posts -> photo discovery -> screenshots -> ordered PDF.
+
+This version keeps the explicit monitoring, validation, intermediate artifacts,
+logging, and partial-results recovery of the original orchestrator. It adds
+photo discovery as a separate, non-fatal stage.
+"""
+
 import asyncio
 import logging
 import re
 import time
-
 from datetime import date, datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from apify import Actor
 
-
 log = logging.getLogger(__name__)
 
-
-# =====================================
-# EXISTING APIFY ACTORS
-# =====================================
-
 SCRAPER_ACTOR = "apify/facebook-posts-scraper"
+PHOTOS_ACTOR = "apify/facebook-photos-scraper"
 SCREENSHOT_ACTOR = "hpbt/website-screenshot-pdf"
 PDF_ACTOR = "hironewf/facebook-png-to-pdf"
 
-
-# =====================================
-# SCRAPER SAFETY SETTINGS
-# =====================================
-
-# Stop after this many consecutive block
-# warnings without additional posts.
 MAX_BLOCK_WARNINGS = 3
-
-# Maximum Facebook scraper runtime.
 SCRAPER_TIMEOUT_SECONDS = 300
-
-# How often to check scraper progress.
 POLL_INTERVAL_SECONDS = 5
-
-
-# =====================================
-# FACEBOOK SCREENSHOT CSS
-# =====================================
 
 CUSTOM_CSS = """
 /* Hide Facebook login popup */
 [role="dialog"]:has(input[type="password"]) {
     display: none !important;
 }
-
 /* Hide translucent backdrop */
 div:has(> div:first-child:empty):has(#login_popup_cta_form) > div:first-child:empty {
     display: none !important;
 }
-
 /* Remove additional overlay tint */
 :root {
     --always-light-overlay: transparent !important;
@@ -59,894 +42,591 @@ div:has(> div:first-child:empty):has(#login_popup_cta_form) > div:first-child:em
 """
 
 
-# =====================================
-# HELPER FUNCTIONS
-# =====================================
+# ------------------------------------------------------------
+# SDK / input helpers
+# ------------------------------------------------------------
+
+def field(obj, name, default=None):
+    """Apify SDK run objects may be dicts or attribute-based models."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def run_field(obj, snake_name, camel_name):
+    return field(obj, snake_name) or field(obj, camel_name)
+
 
 def validate_date(value):
-    """Validate an absolute YYYY-MM-DD date."""
-
-    date_string = str(value).strip()
-
-    if not re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}",
-        date_string,
-    ):
-        raise ValueError(
-            "Only Posts Newer Than must use "
-            "YYYY-MM-DD format."
-        )
-
+    value = str(value).strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("onlyPostsNewerThan must be YYYY-MM-DD")
     try:
-        parsed = date.fromisoformat(date_string)
+        return date.fromisoformat(value).isoformat()
     except ValueError as exc:
-        raise ValueError(
-            "Invalid date. Example: 2026-11-01."
-        ) from exc
-
-    return parsed.isoformat()
+        raise ValueError("Invalid onlyPostsNewerThan date") from exc
 
 
-def get_post_url(item):
-    """Extract a valid Facebook post URL."""
+def valid_facebook_host(host):
+    return (host or "").lower() in {
+        "facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"
+    }
 
-    if not isinstance(item, dict):
-        return None
 
-    url = item.get("url")
-
-    if not isinstance(url, str):
-        return None
-
-    url = url.strip()
-
+def validate_profile_url(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("facebookProfileUrl is required")
+    url = value.strip()
     try:
         parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
+    except ValueError as exc:
+        raise ValueError("Invalid Facebook profile URL") from exc
+    if parsed.scheme not in ("http", "https") or not valid_facebook_host(parsed.hostname):
+        raise ValueError("Enter a valid Facebook profile URL")
+    return url
 
-        if parsed.scheme not in ("http", "https"):
+
+def canonical_post_url(url):
+    """Normalize equivalent post URLs for matching Photos Scraper records.
+
+    Preserve story.php query identifiers; strip tracking queries on /posts/ URLs.
+    Do not use this function for photo-viewer URLs.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ("http", "https") or not valid_facebook_host(parsed.hostname):
             return None
-
-        if hostname not in (
-            "facebook.com",
-            "www.facebook.com",
-            "m.facebook.com",
-            "web.facebook.com",
-        ):
+        path = parsed.path.rstrip("/") or "/"
+        is_path_post = "/posts/" in path or "/permalink/" in path
+        is_query_post = path in ("/story.php", "/permalink.php")
+        if not (is_path_post or is_query_post):
             return None
-
-        if (
-            "/posts/" in parsed.path
-            or "/permalink/" in parsed.path
-            or parsed.path.endswith("/story.php")
-            or parsed.path.endswith("/permalink.php")
-        ):
-            return url
-
+        query = ""
+        if is_query_post:
+            params = parse_qs(parsed.query)
+            # Keep only identity parameters to avoid tracking-query mismatches.
+            pairs = []
+            for key in ("story_fbid", "fbid", "id"):
+                if params.get(key):
+                    pairs.append((key, params[key][0]))
+            if not pairs:
+                return None
+            query = urlencode(pairs)
+        return urlunparse(("https", "www.facebook.com", path, "", query, ""))
     except ValueError:
         return None
 
+
+def post_url_from_record(item):
+    if not isinstance(item, dict):
+        return None
+    return canonical_post_url(item.get("url"))
+
+
+def photo_id(item):
+    if not isinstance(item, dict):
+        return None
+    value = item.get("id")
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value if value.isdigit() else None
+
+
+def mediaset_token(item):
+    if not isinstance(item, dict):
+        return None
+    for media in item.get("media") or []:
+        if isinstance(media, dict):
+            token = media.get("mediaset_token")
+            if isinstance(token, str) and token.startswith("pcb."):
+                return token
     return None
 
 
-async def read_all_items(dataset_id):
-    """Retrieve all records from an Apify dataset."""
+def photo_viewer_url(pid, token=None):
+    params = {"fbid": pid}
+    if token:
+        params["set"] = token
+    return "https://www.facebook.com/photo/?" + urlencode(params)
 
+
+# ------------------------------------------------------------
+# Dataset and downstream Actor helpers
+# ------------------------------------------------------------
+
+async def read_all_items(dataset_id):
     if not dataset_id:
         return []
-
-    dataset = Actor.apify_client.dataset(
-        dataset_id
-    )
-
+    dataset = Actor.apify_client.dataset(dataset_id)
     records = []
     offset = 0
-
     while True:
-        result = await dataset.list_items(
-            offset=offset,
-            limit=1000,
-            clean=False,
-        )
-
+        result = await dataset.list_items(offset=offset, limit=1000, clean=False)
         batch = result.items or []
-
         records.extend(batch)
         offset += len(batch)
-
         if len(batch) < 1000:
             break
-
     return records
 
 
-def extract_post_urls(records):
-    """Deduplicate valid Facebook post URLs."""
-
-    urls = []
-    seen = set()
-
-    for item in records:
-        url = get_post_url(item)
-
-        if url and url not in seen:
-            seen.add(url)
-            urls.append(url)
-
-    return urls
-
-
 async def call_actor(actor_id, run_input):
-    """Call a downstream Actor normally."""
-
-    log.info("Starting Actor: %s", actor_id)
-
-    run = await Actor.call(
-        actor_id=actor_id,
-        run_input=run_input,
-    )
-
+    log.info("Starting Actor %s", actor_id)
+    run = await Actor.call(actor_id=actor_id, run_input=run_input)
     if run is None:
+        raise RuntimeError(f"{actor_id} did not return a run")
+    status = field(run, "status")
+    if status != "SUCCEEDED":
         raise RuntimeError(
-            f"{actor_id} returned no run."
+            f"{actor_id} ended with status {status}; Run ID: {field(run, 'id')}"
         )
-
-    if run.status != "SUCCEEDED":
-        raise RuntimeError(
-            f"{actor_id} ended with status "
-            f"{run.status}. Run ID: {run.id}"
-        )
-
-    log.info(
-        "%s succeeded. Run ID: %s",
-        actor_id,
-        run.id,
-    )
-
+    log.info("Actor %s succeeded; run=%s", actor_id, field(run, "id"))
     return run
 
 
-# =====================================
-# SCRAPER LOG MONITORING
-# =====================================
+# ------------------------------------------------------------
+# Posts Scraper monitoring (preserved safeguard)
+# ------------------------------------------------------------
 
-def parse_scraper_events(log_text):
+def new_log_lines(previous_text, current_text):
+    """Count only newly appended *complete* lines.
+
+    Log retrieval normally returns cumulative text. When it is replaced or
+    truncated, skip the uncertain section rather than double-count blocks.
     """
-    Extract block and progress events from
-    the Facebook scraper logs.
+    if not current_text:
+        return [], current_text
+    if not current_text.startswith(previous_text):
+        if previous_text:
+            log.warning("Scraper log changed/truncated; resetting monitoring cursor")
+            return [], current_text
+    new_text = current_text[len(previous_text):]
+    if not new_text:
+        return [], current_text
+    # Defer the final incomplete line until the next poll.
+    if not new_text.endswith("\n"):
+        complete, sep, _ = new_text.rpartition("\n")
+        if not sep:
+            return [], previous_text
+        consumed = len(previous_text) + len(complete) + 1
+        return complete.splitlines(), current_text[:consumed]
+    return new_text.splitlines(), current_text
 
-    BLOCKED and SOFT-BLOCKED are counted
-    only when they appear in scraper
-    warning messages.
-    """
 
-    events = []
-
-    for line in log_text.splitlines():
-
-        if "CheerioCrawler:" in line and (
-            "SOFT-BLOCKED" in line
-            or "BLOCKED" in line
-        ):
-            events.append(("block", None))
-            continue
-
+def inspect_scraper_log_lines(lines, block_count):
+    """Reset block streak on scraper progress; otherwise count block warnings."""
+    for line in lines:
         if "[PROGRESS]" in line:
-            match = re.search(
-                r"Found\s+(\d+)\s+new page posts",
-                line,
-            )
-
-            if match:
-                new_posts = int(match.group(1))
-
-                if new_posts > 0:
-                    events.append(
-                        ("progress", new_posts)
-                    )
-
-    return events
+            match = re.search(r"Found\s+(\d+)\s+new page posts", line)
+            if match and int(match.group(1)) > 0:
+                block_count = 0
+                log.info("Scraper reports %s newly found posts", match.group(1))
+                continue
+        if "CheerioCrawler:" in line and (
+            "SOFT-BLOCKED" in line or "BLOCKED" in line
+        ):
+            block_count += 1
+            log.warning("Scraper block warning %s/%s", block_count, MAX_BLOCK_WARNINGS)
+    return block_count
 
 
-async def run_monitored_scraper(scraper_input):
-    """
-    Start the Facebook scraper and monitor
-    its logs and dataset.
-
-    Stop when:
-      - The scraper completes normally
-      - 3 consecutive block warnings occur
-      - 5 minutes elapse
-
-    Preserve available dataset records.
-    """
-
-    log.info(
-        "STEP 1: Starting monitored "
-        "Facebook scraper"
-    )
-
-    actor_client = Actor.apify_client.actor(
-        SCRAPER_ACTOR
-    )
-
-    started_run = await actor_client.start(
+async def monitored_posts_scraper(scraper_input):
+    """Monitor, abort stalled scraper, and recover dataset records if available."""
+    log.info("STEP 1: Starting Facebook Posts Scraper")
+    started = await Actor.apify_client.actor(SCRAPER_ACTOR).start(
         run_input=scraper_input
     )
-
-    if not started_run:
-        raise RuntimeError(
-            "Could not start Facebook scraper."
-        )
-
-    run_id = started_run["id"]
-
-    run_client = Actor.apify_client.run(
-        run_id
-    )
-
-    dataset_id = started_run.get(
-        "defaultDatasetId"
-    )
-
-    log.info(
-        "Facebook scraper started: %s",
-        run_id,
-    )
-
-    start_time = time.monotonic()
-
-    # Number of consecutive block warnings
-    # since the last reported progress.
+    run_id = field(started, "id")
+    if not run_id:
+        raise RuntimeError("Posts Scraper did not return a run ID")
+    run_client = Actor.apify_client.run(run_id)
+    dataset_id = run_field(started, "default_dataset_id", "defaultDatasetId")
+    terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+    started_at = time.monotonic()
+    previous_log = ""
     consecutive_blocks = 0
-
-    # Number of parsed log events already seen.
-    processed_event_count = 0
-
     stop_reason = None
     final_status = None
 
-    terminal_statuses = {
-        "SUCCEEDED",
-        "FAILED",
-        "ABORTED",
-        "TIMED-OUT",
-    }
-
     while True:
-
-        # ---------------------------------
-        # CHECK CURRENT RUN STATUS
-        # ---------------------------------
-
         run_info = await run_client.get()
-
         if not run_info:
-            raise RuntimeError(
-                "Could not retrieve scraper status."
+            raise RuntimeError(f"Cannot retrieve scraper run {run_id}")
+        final_status = field(run_info, "status")
+        dataset_id = run_field(run_info, "default_dataset_id", "defaultDatasetId") or dataset_id
+
+        if final_status in terminal:
+            stop_reason = (
+                "completed_normally" if final_status == "SUCCEEDED"
+                else f"scraper_{str(final_status).lower()}"
             )
-
-        status = run_info.get("status")
-
-        dataset_id = (
-            run_info.get("defaultDatasetId")
-            or dataset_id
-        )
-
-        if status in terminal_statuses:
-            final_status = status
-
-            if status == "SUCCEEDED":
-                stop_reason = "completed_normally"
-            else:
-                stop_reason = (
-                    f"scraper_{status.lower()}"
-                )
-
-            log.info(
-                "Scraper finished with status %s",
-                status,
-            )
-
             break
 
-        # ---------------------------------
-        # CHECK ELAPSED TIME
-        # ---------------------------------
-
-        elapsed = (
-            time.monotonic() - start_time
-        )
-
+        elapsed = time.monotonic() - started_at
         if elapsed >= SCRAPER_TIMEOUT_SECONDS:
             stop_reason = "timeout"
-
-            log.warning(
-                "Scraper exceeded %s seconds. "
-                "Stopping and preserving results.",
-                SCRAPER_TIMEOUT_SECONDS,
-            )
-
+            log.warning("Posts Scraper exceeded %s seconds", SCRAPER_TIMEOUT_SECONDS)
             break
 
-        # ---------------------------------
-        # READ SCRAPER LOGS
-        # ---------------------------------
-
         try:
-            log_text = await run_client.log().get()
+            raw = await run_client.log().get()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            lines, previous_log = new_log_lines(previous_log, raw or "")
+            consecutive_blocks = inspect_scraper_log_lines(lines, consecutive_blocks)
+        except Exception as exc:
+            log.warning("Scraper log monitoring failed; will retry: %s", exc)
 
-            if isinstance(log_text, bytes):
-                log_text = log_text.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-
-            events = parse_scraper_events(
-                log_text or ""
-            )
-
-            # Only process events we haven't
-            # already counted.
-            new_events = events[
-                processed_event_count:
-            ]
-
-            processed_event_count = len(events)
-
-            for event_type, value in new_events:
-
-                if event_type == "progress":
-                    consecutive_blocks = 0
-
-                    log.info(
-                        "Scraper progress: "
-                        "%s additional posts reported.",
-                        value,
-                    )
-
-                elif event_type == "block":
-                    consecutive_blocks += 1
-
-                    log.warning(
-                        "Facebook block warning "
-                        "%s/%s",
-                        consecutive_blocks,
-                        MAX_BLOCK_WARNINGS,
-                    )
-
-        except Exception:
-            log.exception(
-                "Could not inspect scraper logs. "
-                "Will retry monitoring."
-            )
-
-        # ---------------------------------
-        # STOP AFTER REPEATED BLOCKS
-        # ---------------------------------
-
-        if (
-            consecutive_blocks
-            >= MAX_BLOCK_WARNINGS
-        ):
+        if consecutive_blocks >= MAX_BLOCK_WARNINGS:
             stop_reason = "block_limit"
-
-            log.warning(
-                "Reached %s consecutive block "
-                "warnings. Stopping scraper.",
-                MAX_BLOCK_WARNINGS,
-            )
-
+            log.warning("Stopping Posts Scraper after repeated block warnings")
             break
 
-        await asyncio.sleep(
-            POLL_INTERVAL_SECONDS
-        )
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-    # =====================================
-    # STOP SCRAPER IF STILL RUNNING
-    # =====================================
-
-    if stop_reason in (
-        "timeout",
-        "block_limit",
-    ):
+    if stop_reason in ("timeout", "block_limit"):
         try:
-            current_run = await run_client.get()
+            latest = await run_client.get()
+            if latest and field(latest, "status") not in terminal:
+                await run_client.abort(gracefully=False)
+                log.info("Aborted Posts Scraper run %s", run_id)
+        except Exception as exc:
+            log.warning("Could not abort Posts Scraper run %s: %s", run_id, exc)
 
-            if (
-                current_run
-                and current_run.get("status")
-                not in terminal_statuses
-            ):
-                log.info(
-                    "Aborting scraper run %s",
-                    run_id,
-                )
-
-                await run_client.abort(
-                    gracefully=False
-                )
-
-        except Exception:
-            log.exception(
-                "Could not abort scraper run."
-            )
-
-    # =====================================
-    # RETRIEVE PARTIAL RESULTS
-    # =====================================
-
-    # Allow a short interval for the final
-    # run state to become available.
     try:
-        current_run = await run_client.get()
-
-        if current_run:
-            final_status = current_run.get(
-                "status"
-            )
-
-            dataset_id = (
-                current_run.get(
-                    "defaultDatasetId"
-                )
-                or dataset_id
-            )
-
-    except Exception:
-        log.warning(
-            "Could not refresh final scraper status."
-        )
+        latest = await run_client.get()
+        if latest:
+            final_status = field(latest, "status")
+            dataset_id = run_field(latest, "default_dataset_id", "defaultDatasetId") or dataset_id
+    except Exception as exc:
+        log.warning("Could not refresh final Posts Scraper status: %s", exc)
 
     if not dataset_id:
-        raise RuntimeError(
-            "Facebook scraper returned "
-            "no dataset ID."
-        )
-
-    records = await read_all_items(
-        dataset_id
-    )
-
-    post_urls = extract_post_urls(
-        records
-    )
+        raise RuntimeError(f"Posts Scraper returned no dataset ID; run={run_id}")
+    records = await read_all_items(dataset_id)
+    posts = []
+    seen = set()
+    for record in records:
+        url = post_url_from_record(record)
+        if url and url not in seen:
+            seen.add(url)
+            posts.append({"url": url, "raw": record, "photos": []})
 
     log.info(
-        "Scraper stopped: reason=%s, "
-        "status=%s, records=%s, URLs=%s",
-        stop_reason,
-        final_status,
-        len(records),
-        len(post_urls),
+        "STEP 1 COMPLETE: status=%s reason=%s records=%s unique posts=%s",
+        final_status, stop_reason, len(records), len(posts)
     )
-
-    if not post_urls:
+    if not posts:
         raise RuntimeError(
-            "Facebook scraper stopped without "
-            "collecting any usable post URLs. "
-            f"Reason: {stop_reason}. "
-            f"Run ID: {run_id}"
+            "No usable Facebook posts were collected. "
+            f"Scraper status={final_status}, reason={stop_reason}, run={run_id}"
         )
-
     if stop_reason != "completed_normally":
-        log.warning(
-            "Using %s collected posts despite "
-            "scraper not completing normally.",
-            len(post_urls),
-        )
-
-    return {
+        log.warning("Continuing with %s partial posts", len(posts))
+    return posts, {
         "runId": run_id,
         "datasetId": dataset_id,
-        "records": records,
-        "postUrls": post_urls,
         "stopReason": stop_reason,
         "finalStatus": final_status,
+        "postsScraped": len(records),
+        "uniquePostUrls": len(posts),
     }
 
 
-# =====================================
-# MAIN WORKFLOW
-# =====================================
+# ------------------------------------------------------------
+# Photos Scraper: one global-limit run, graceful empty/failure
+# ------------------------------------------------------------
+
+def direct_image_url(row):
+    """Use the image URL returned by the Photos Scraper, not a Facebook viewer URL."""
+    image = row.get("image")
+    if isinstance(image, str) and image.startswith(("https://", "http://")):
+        return image
+    if isinstance(image, dict):
+        for key in ("url", "uri", "src", "href"):
+            value = image.get(key)
+            if isinstance(value, str) and value.startswith(("https://", "http://")):
+                return value
+    return None
+
+
+async def collect_photos(posts, photos_results_limit):
+    """Discover original image URLs, retaining only photos beyond the first five.
+
+    The first five photos are already represented in the original post screenshot.
+    The Photos Scraper's resultsLimit applies to the entire run.
+    """
+    log.info("STEP 2: Discovering direct photos (global limit=%s)", photos_results_limit)
+    by_url = {post["url"]: post for post in posts}
+    discovered = {post["url"]: [] for post in posts}
+    seen = {post["url"]: set() for post in posts}
+    photos_run_id = None
+    photos_status = "NOT_STARTED"
+    photo_rows = []
+    photo_error = None
+    photos_input = {
+        "resultsLimit": photos_results_limit,
+        "startUrls": [{"url": post["url"]} for post in posts],
+    }
+    try:
+        run = await Actor.call(actor_id=PHOTOS_ACTOR, run_input=photos_input)
+        if run is None:
+            raise RuntimeError("Photos Scraper returned no run")
+        photos_run_id = field(run, "id")
+        photos_status = field(run, "status")
+        dataset_id = run_field(run, "default_dataset_id", "defaultDatasetId")
+        if dataset_id:
+            photo_rows = await read_all_items(dataset_id)
+        if photos_status != "SUCCEEDED":
+            log.warning("Photos Scraper ended with %s; using any returned photos", photos_status)
+    except Exception as exc:
+        photo_error = str(exc)
+        photos_status = "ERROR"
+        log.warning("Photos Scraper failed: %s; posts will still be included", exc)
+
+    unmatched = 0
+    missing_images = 0
+    for row in photo_rows:
+        if not isinstance(row, dict):
+            continue
+        parent = canonical_post_url(row.get("facebookUrl"))
+        pid = photo_id(row)
+        if parent not in by_url or not pid:
+            unmatched += 1
+            continue
+        image_url = direct_image_url(row)
+        if not image_url:
+            missing_images += 1
+            continue
+        if pid not in seen[parent]:
+            seen[parent].add(pid)
+            discovered[parent].append({"id": pid, "imageUrl": image_url})
+
+    skipped_previews = 0
+    for post in posts:
+        parent = post["url"]
+        preview_ids = []
+        for media in post["raw"].get("media") or []:
+            if not isinstance(media, dict):
+                continue
+            if media.get("__typename") == "Photo" or media.get("__isMedia") == "Photo":
+                pid = photo_id(media)
+                if pid and pid not in preview_ids:
+                    preview_ids.append(pid)
+        # Prefer matching the five preview IDs exactly. If they aren't available,
+        # assume the Photos Scraper returns the photos in original post order.
+        if preview_ids:
+            preview_set = set(preview_ids[:5])
+            retained = [photo for photo in discovered[parent] if photo["id"] not in preview_set]
+        else:
+            retained = discovered[parent][5:]
+            if discovered[parent]:
+                log.warning("No preview IDs for %s; skipping first five returned photos by order", parent)
+        skipped_previews += len(discovered[parent]) - len(retained)
+        post["photos"] = retained
+        log.info("Post %s: %s additional direct images", parent, len(retained))
+
+    total = sum(len(post["photos"]) for post in posts)
+    log.info("STEP 2 COMPLETE: rows=%s, extra images=%s, skipped previews=%s, missing image URLs=%s",
+             len(photo_rows), total, skipped_previews, missing_images)
+    return {
+        "runId": photos_run_id,
+        "status": photos_status,
+        "error": photo_error,
+        "resultsLimit": photos_results_limit,
+        "rowsReturned": len(photo_rows),
+        "unmatchedRows": unmatched,
+        "missingImageUrls": missing_images,
+        "previewPhotosSkipped": skipped_previews,
+        "additionalPhotoPages": total,
+    }
+
+
+# ------------------------------------------------------------
+# Manifest and screenshot stages
+# ------------------------------------------------------------
+
+def build_manifest(posts):
+    """Order: post screenshot, its extra original images, next post, ..."""
+    manifest = []
+    for number, post in enumerate(posts, start=1):
+        manifest.append({
+            "kind": "post", "postNumber": number, "url": post["url"]
+        })
+        for photo in post["photos"]:
+            manifest.append({
+                "kind": "photo", "postNumber": number,
+                "photoId": photo["id"], "url": post["url"],
+                "imageUrl": photo["imageUrl"]
+            })
+    return manifest
+
+
+async def run_screenshots(manifest, width, height):
+    """Screenshot Actor output order is not trusted; merger matches by URL."""
+    urls = list(dict.fromkeys(entry["url"] for entry in manifest if entry["kind"] == "post"))
+    log.info("STEP 3: Requesting %s screenshots", len(urls))
+    screenshot_input = {
+        "customCss": CUSTOM_CSS,
+        "devices": ["custom"],
+        "format": "png",
+        "fullPage": False,
+        "hideChatWidgets": False,
+        "hideCookieBanners": False,
+        "hideSelectors": [],
+        "pdfLandscape": False,
+        "pdfPrintBackground": True,
+        "proxyConfiguration": {"useApifyProxy": False},
+        "scrollPage": True,
+        "urls": urls,
+        "viewportHeight": height,
+        "viewportWidth": width,
+    }
+    run = await call_actor(SCREENSHOT_ACTOR, screenshot_input)
+    dataset_id = run_field(run, "default_dataset_id", "defaultDatasetId")
+    if not dataset_id:
+        raise RuntimeError("Screenshot Actor returned no dataset ID")
+    rows = await read_all_items(dataset_id)
+    if not rows:
+        raise RuntimeError("Screenshot Actor returned an empty dataset")
+    successes = sum(
+        1 for row in rows if isinstance(row, dict)
+        and str(row.get("status", "")).lower() == "success"
+    )
+    log.info("STEP 3 COMPLETE: screenshot rows=%s successes=%s", len(rows), successes)
+    return run, dataset_id, rows
+
+
+async def run_pdf_merger(dataset_id, manifest, page_size, max_image_height):
+    log.info("STEP 4: Building ordered PDF from %s manifest entries", len(manifest))
+    merger_input = {
+        "datasetId": dataset_id,
+        "manifest": manifest,
+        "pageSize": page_size,
+        "marginPoints": 30,
+        "trimWhiteEdges": False,
+        "maxImageHeight": max_image_height,
+    }
+    run = await call_actor(PDF_ACTOR, merger_input)
+    store_id = run_field(run, "default_key_value_store_id", "defaultKeyValueStoreId")
+    if not store_id:
+        raise RuntimeError("PDF merger returned no key-value store ID")
+    store = Actor.apify_client.key_value_store(store_id)
+    record = await store.get_record("facebook-posts.pdf")
+    if not record:
+        raise RuntimeError("PDF merger completed but facebook-posts.pdf was not found")
+    pdf_bytes = field(record, "value")
+    if isinstance(pdf_bytes, bytearray):
+        pdf_bytes = bytes(pdf_bytes)
+    if not isinstance(pdf_bytes, bytes):
+        raise RuntimeError("PDF record did not contain binary PDF data")
+    await Actor.set_value("facebook-posts.pdf", pdf_bytes, content_type="application/pdf")
+    summary_record = await store.get_record("SUMMARY")
+    merger_summary = field(summary_record, "value") if summary_record else None
+    log.info("STEP 4 COMPLETE: PDF saved (%s bytes)", len(pdf_bytes))
+    return run, merger_summary
+
+
+# ------------------------------------------------------------
+# Main orchestration
+# ------------------------------------------------------------
 
 async def main():
-
-    print(
-        "FACEBOOK WORKFLOW: Started",
-        flush=True,
-    )
-
+    print("FACEBOOK WORKFLOW: Started", flush=True)
     async with Actor:
-
         config = await Actor.get_input() or {}
-
-        # =================================
-        # INPUT CONFIGURATION
-        # =================================
-
-        profile_url = (
-            config.get("facebookProfileUrl")
-            or ""
-        ).strip()
-
-        if not profile_url:
-            raise ValueError(
-                "facebookProfileUrl is required."
-            )
-
-        parsed = urlparse(profile_url)
-
-        if (
-            parsed.scheme not in (
-                "http",
-                "https",
-            )
-            or (parsed.hostname or "").lower()
-            not in (
-                "facebook.com",
-                "www.facebook.com",
-                "m.facebook.com",
-                "web.facebook.com",
-            )
-        ):
-            raise ValueError(
-                "Enter a valid Facebook profile URL."
-            )
-
-        results_limit = int(
-            config.get("resultsLimit", 20)
-        )
-
-        only_newer_than = validate_date(
-            config.get("onlyPostsNewerThan")
-            or "2025-12-31"
-        )
-
-        viewport_width = int(
-            config.get("viewportWidth", 800)
-        )
-
-        viewport_height = int(
-            config.get("viewportHeight", 1280)
-        )
-
-        max_image_height = int(
-            config.get("maxImageHeight", 1400)
-        )
-
-        page_size = (
-            config.get("pageSize")
-            or "LETTER"
-        ).upper()
+        profile_url = validate_profile_url(config.get("facebookProfileUrl"))
+        results_limit = int(config.get("resultsLimit", 20))
+        photos_results_limit = int(config.get("photosResultsLimit", 100))
+        only_newer_than = validate_date(config.get("onlyPostsNewerThan") or "2025-12-31")
+        viewport_width = int(config.get("viewportWidth", 800))
+        viewport_height = int(config.get("viewportHeight", 1280))
+        max_image_height = int(config.get("maxImageHeight", 1400))
+        page_size = str(config.get("pageSize") or "LETTER").upper()
 
         if results_limit < 1:
-            raise ValueError(
-                "resultsLimit must be positive."
-            )
-
-        if (
-            viewport_width < 1
-            or viewport_height < 1
-        ):
-            raise ValueError(
-                "Viewport dimensions must be positive."
-            )
-
+            raise ValueError("resultsLimit must be positive")
+        if photos_results_limit < 1:
+            raise ValueError("photosResultsLimit must be positive")
+        if viewport_width < 1 or viewport_height < 1:
+            raise ValueError("Viewport dimensions must be positive")
         if max_image_height < 0:
-            raise ValueError(
-                "maxImageHeight cannot be negative."
-            )
+            raise ValueError("maxImageHeight must not be negative")
+        if page_size not in ("LETTER", "A4"):
+            raise ValueError("pageSize must be LETTER or A4")
 
-        if page_size not in (
-            "LETTER",
-            "A4",
-        ):
-            raise ValueError(
-                "pageSize must be LETTER or A4."
-            )
+        log.info("Profile URL: %s", profile_url)
+        log.info("Requested maximum posts: %s", results_limit)
+        log.info("Requested maximum photos (global): %s", photos_results_limit)
+        log.info("Only posts newer than: %s", only_newer_than)
+        log.info("Viewport: %sx%s; PDF page size: %s", viewport_width, viewport_height, page_size)
 
-        log.info(
-            "Profile: %s",
-            profile_url,
-        )
-
-        log.info(
-            "Requested maximum posts: %s",
-            results_limit,
-        )
-
-        log.info(
-            "Posts newer than: %s",
-            only_newer_than,
-        )
-
-        # =================================
-        # STEP 1: FACEBOOK SCRAPER
-        # =================================
-
-        scraper_input = {
+        posts_input = {
             "captionText": False,
             "onlyPostsNewerThan": only_newer_than,
             "resultsLimit": results_limit,
-            "startUrls": [
-                {
-                    "url": profile_url
-                }
-            ],
+            "startUrls": [{"url": profile_url}],
         }
+        posts, posts_info = await monitored_posts_scraper(posts_input)
+        await Actor.set_value("POST_URLS", {
+            "profileUrl": profile_url,
+            "onlyPostsNewerThan": only_newer_than,
+            "requestedMaximum": results_limit,
+            "count": len(posts),
+            "urls": [post["url"] for post in posts],
+            "scraperStopReason": posts_info["stopReason"],
+        })
 
-        scraper_result = (
-            await run_monitored_scraper(
-                scraper_input
-            )
+        photos_info = await collect_photos(posts, photos_results_limit)
+        manifest = build_manifest(posts)
+        await Actor.set_value("REPORT_MANIFEST", {
+            "profileUrl": profile_url,
+            "entries": manifest,
+            "posts": len(posts),
+            "photoPages": sum(len(post["photos"]) for post in posts),
+        })
+        log.info("Manifest prepared with %s ordered pages", len(manifest))
+
+        screenshot_run, screenshot_dataset_id, screenshot_rows = await run_screenshots(
+            manifest, viewport_width, viewport_height
         )
-
-        records = scraper_result["records"]
-
-        post_urls = scraper_result[
-            "postUrls"
-        ]
-
-        scraper_run_id = scraper_result[
-            "runId"
-        ]
-
-        scraper_stop_reason = scraper_result[
-            "stopReason"
-        ]
-
-        log.info(
-            "STEP 1 COMPLETE: %s posts available.",
-            len(post_urls),
+        merger_run, merger_summary = await run_pdf_merger(
+            screenshot_dataset_id, manifest, page_size, max_image_height
         )
-
-        await Actor.set_value(
-            "POST_URLS",
-            {
-                "profileUrl": profile_url,
-                "onlyPostsNewerThan": only_newer_than,
-                "requestedMaximum": results_limit,
-                "count": len(post_urls),
-                "urls": post_urls,
-                "scraperStopReason": (
-                    scraper_stop_reason
-                ),
-            },
-        )
-
-        # =================================
-        # STEP 2: SCREENSHOT ACTOR
-        # =================================
-
-        log.info(
-            "STEP 2: Capturing %s screenshots",
-            len(post_urls),
-        )
-
-        screenshot_input = {
-            "customCss": CUSTOM_CSS,
-            "devices": ["custom"],
-            "format": "png",
-            "fullPage": False,
-            "hideChatWidgets": False,
-            "hideCookieBanners": False,
-            "hideSelectors": [],
-            "pdfLandscape": False,
-            "pdfPrintBackground": True,
-            "proxyConfiguration": {
-                "useApifyProxy": False
-            },
-            "scrollPage": True,
-            "urls": post_urls,
-            "viewportHeight": viewport_height,
-            "viewportWidth": viewport_width,
-        }
-
-        screenshot_run = await call_actor(
-            SCREENSHOT_ACTOR,
-            screenshot_input,
-        )
-
-        screenshot_dataset_id = (
-            screenshot_run.default_dataset_id
-        )
-
-        if not screenshot_dataset_id:
-            raise RuntimeError(
-                "Screenshot Actor returned "
-                "no dataset ID."
-            )
-
-        screenshot_records = (
-            await read_all_items(
-                screenshot_dataset_id
-            )
-        )
-
-        if not screenshot_records:
-            raise RuntimeError(
-                "Screenshot Actor returned "
-                "an empty dataset."
-            )
-
-        log.info(
-            "STEP 2 COMPLETE: "
-            "%s screenshot records.",
-            len(screenshot_records),
-        )
-
-        # =================================
-        # STEP 3: PDF MERGER
-        # =================================
-
-        log.info(
-            "STEP 3: Generating PDF"
-        )
-
-        merger_input = {
-            "datasetId": screenshot_dataset_id,
-            "pageSize": page_size,
-            "marginPoints": 30,
-            "trimWhiteEdges": False,
-            "maxImageHeight": max_image_height,
-        }
-
-        merger_run = await call_actor(
-            PDF_ACTOR,
-            merger_input,
-        )
-
-        merger_store_id = (
-            merger_run.default_key_value_store_id
-        )
-
-        if not merger_store_id:
-            raise RuntimeError(
-                "PDF merger returned no "
-                "key-value store ID."
-            )
-
-        merger_store = (
-            Actor.apify_client.key_value_store(
-                merger_store_id
-            )
-        )
-
-        pdf_record = (
-            await merger_store.get_record(
-                "facebook-posts.pdf"
-            )
-        )
-
-        if not pdf_record:
-            raise RuntimeError(
-                "PDF merger completed but "
-                "facebook-posts.pdf was not found."
-            )
-
-        pdf_bytes = pdf_record.get(
-            "value"
-        )
-
-        if isinstance(
-            pdf_bytes,
-            bytearray,
-        ):
-            pdf_bytes = bytes(
-                pdf_bytes
-            )
-
-        if not isinstance(
-            pdf_bytes,
-            bytes,
-        ):
-            raise RuntimeError(
-                "PDF record did not contain "
-                "binary PDF data."
-            )
-
-        await Actor.set_value(
-            "facebook-posts.pdf",
-            pdf_bytes,
-            content_type="application/pdf",
-        )
-
-        merger_summary_record = (
-            await merger_store.get_record(
-                "SUMMARY"
-            )
-        )
-
-        merger_summary = (
-            merger_summary_record.get("value")
-            if merger_summary_record
-            else None
-        )
-
-        log.info(
-            "STEP 3 COMPLETE: PDF saved."
-        )
-
-        # =================================
-        # STEP 4: FINAL SUMMARY
-        # =================================
 
         summary = {
             "status": "success",
             "facebookProfileUrl": profile_url,
             "onlyPostsNewerThan": only_newer_than,
-
-            "requestedMaximumPosts": (
-                results_limit
-            ),
-
-            "postsScraped": len(records),
-
-            "uniquePostUrls": len(
-                post_urls
-            ),
-
-            "scraperStopReason": (
-                scraper_stop_reason
-            ),
-
-            "scraperFinalStatus": (
-                scraper_result["finalStatus"]
-            ),
-
-            "scraperCompletedNormally": (
-                scraper_stop_reason
-                == "completed_normally"
-            ),
-
-            "screenshotDatasetRecords": len(
-                screenshot_records
-            ),
-
-            "scraperRunId": (
-                scraper_run_id
-            ),
-
-            "screenshotRunId": (
-                screenshot_run.id
-            ),
-
-            "mergerRunId": (
-                merger_run.id
-            ),
-
+            "requestedMaximumPosts": results_limit,
+            "postsScraped": posts_info["postsScraped"],
+            "uniquePostUrls": len(posts),
+            "scraperRunId": posts_info["runId"],
+            "scraperStopReason": posts_info["stopReason"],
+            "scraperFinalStatus": posts_info["finalStatus"],
+            "scraperCompletedNormally": posts_info["stopReason"] == "completed_normally",
+            "photosResultsLimit": photos_results_limit,
+            "photosScraper": photos_info,
+            "additionalPhotosIncluded": sum(len(post["photos"]) for post in posts),
+            "screenshotsRequested": len(set(entry["url"] for entry in manifest if entry["kind"] == "post")),
+            "screenshotDatasetRecords": len(screenshot_rows),
+            "screenshotRunId": field(screenshot_run, "id"),
+            "mergerRunId": field(merger_run, "id"),
             "pdfKey": "facebook-posts.pdf",
-
             "pdfSummary": merger_summary,
-
-            "generatedAt": datetime.now(
-                timezone.utc
-            ).isoformat(),
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
         }
-
-        await Actor.set_value(
-            "SUMMARY",
-            summary,
-        )
-
-        await Actor.push_data(
-            summary
-        )
-
+        await Actor.set_value("SUMMARY", summary)
+        await Actor.push_data(summary)
         log.info(
-            "WORKFLOW COMPLETE: "
-            "%s/%s requested posts collected. "
-            "PDF generated successfully.",
-            len(post_urls),
-            results_limit,
+            "WORKFLOW COMPLETE: %s posts, %s photos, %s PDF pages",
+            len(posts), summary["additionalPhotosIncluded"],
+            field(merger_summary, "pages", "unknown")
         )
-
-        print(
-            "FACEBOOK WORKFLOW: Completed",
-            flush=True,
-        )
+        print("FACEBOOK WORKFLOW: Completed", flush=True)
 
 
 if __name__ == "__main__":
