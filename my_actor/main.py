@@ -1,10 +1,3 @@
-"""Facebook posts -> photo discovery -> screenshots -> ordered PDF.
-
-This version keeps the explicit monitoring, validation, intermediate artifacts,
-logging, and partial-results recovery of the original orchestrator. It adds
-photo discovery as a separate, non-fatal stage.
-"""
-
 import asyncio
 import logging
 import re
@@ -449,9 +442,9 @@ async def collect_photos(posts, photos_results_limit):
 # Manifest and screenshot stages
 # ------------------------------------------------------------
 
-def build_manifest(posts):
+def build_manifest(posts, profile_url):
     """Order: post screenshot, its extra original images, next post, ..."""
-    manifest = []
+    manifest = [{"kind": "profile", "url": profile_url}]
     for number, post in enumerate(posts, start=1):
         manifest.append({
             "kind": "post", "postNumber": number, "url": post["url"]
@@ -465,9 +458,9 @@ def build_manifest(posts):
     return manifest
 
 
-async def run_screenshots(manifest, width, height):
+async def run_screenshots(manifest, width, height, kind="post"):
     """Screenshot Actor output order is not trusted; merger matches by URL."""
-    urls = list(dict.fromkeys(entry["url"] for entry in manifest if entry["kind"] == "post"))
+    urls = list(dict.fromkeys(entry["url"] for entry in manifest if entry["kind"] == kind))
     log.info("STEP 3: Requesting %s screenshots", len(urls))
     screenshot_input = {
         "customCss": CUSTOM_CSS,
@@ -480,7 +473,7 @@ async def run_screenshots(manifest, width, height):
         "pdfLandscape": False,
         "pdfPrintBackground": True,
         "proxyConfiguration": {"useApifyProxy": False},
-        "scrollPage": True,
+        "scrollPage": kind != "profile",
         "urls": urls,
         "viewportHeight": height,
         "viewportWidth": width,
@@ -500,10 +493,11 @@ async def run_screenshots(manifest, width, height):
     return run, dataset_id, rows
 
 
-async def run_pdf_merger(dataset_id, manifest, page_size, max_image_height):
+async def run_pdf_merger(dataset_id, manifest, page_size, max_image_height, profile_dataset_id):
     log.info("STEP 4: Building ordered PDF from %s manifest entries", len(manifest))
     merger_input = {
         "datasetId": dataset_id,
+        "profileDatasetId": profile_dataset_id,
         "manifest": manifest,
         "pageSize": page_size,
         "marginPoints": 30,
@@ -581,7 +575,7 @@ async def main():
         })
 
         photos_info = await collect_photos(posts, photos_results_limit)
-        manifest = build_manifest(posts)
+        manifest = build_manifest(posts, profile_url)
         await Actor.set_value("REPORT_MANIFEST", {
             "profileUrl": profile_url,
             "entries": manifest,
@@ -590,11 +584,14 @@ async def main():
         })
         log.info("Manifest prepared with %s ordered pages", len(manifest))
 
+        profile_run, profile_dataset_id, profile_rows = await run_screenshots(
+            manifest, viewport_width, viewport_height, kind="profile"
+        )
         screenshot_run, screenshot_dataset_id, screenshot_rows = await run_screenshots(
             manifest, viewport_width, viewport_height
         )
         merger_run, merger_summary = await run_pdf_merger(
-            screenshot_dataset_id, manifest, page_size, max_image_height
+            screenshot_dataset_id, manifest, page_size, max_image_height, profile_dataset_id
         )
 
         summary = {
@@ -611,7 +608,10 @@ async def main():
             "photosResultsLimit": photos_results_limit,
             "photosScraper": photos_info,
             "additionalPhotosIncluded": sum(len(post["photos"]) for post in posts),
-            "screenshotsRequested": len(set(entry["url"] for entry in manifest if entry["kind"] == "post")),
+            "screenshotsRequested": len(set(entry["url"] for entry in manifest if entry["kind"] in ("profile", "post"))),
+            "profileScreenshotRunId": field(profile_run, "id"),
+            "profileScreenshotDatasetId": profile_dataset_id,
+            "profileScreenshotDatasetRecords": len(profile_rows),
             "screenshotDatasetRecords": len(screenshot_rows),
             "screenshotRunId": field(screenshot_run, "id"),
             "mergerRunId": field(merger_run, "id"),
