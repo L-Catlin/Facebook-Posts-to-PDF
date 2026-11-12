@@ -86,7 +86,6 @@ def canonical_post_url(url):
     """Normalize equivalent post URLs for matching Photos Scraper records.
 
     Preserve story.php query identifiers; strip tracking queries on /posts/ URLs.
-    Do not use this function for photo-viewer URLs.
     """
     if not isinstance(url, str) or not url.strip():
         return None
@@ -190,8 +189,6 @@ async def call_actor(actor_id, run_input):
 def new_log_lines(previous_text, current_text):
     """Count only newly appended *complete* lines.
 
-    Log retrieval normally returns cumulative text. When it is replaced or
-    truncated, skip the uncertain section rather than double-count blocks.
     """
     if not current_text:
         return [], current_text
