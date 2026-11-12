@@ -1,8 +1,16 @@
+"""Facebook posts -> photo discovery -> screenshots -> ordered PDF.
+
+This version keeps the explicit monitoring, validation, intermediate artifacts,
+logging, and partial-results recovery of the original orchestrator. It adds
+photo discovery as a separate, non-fatal stage.
+"""
+
 import asyncio
 import io
 import httpx
 from PIL import Image
 import logging
+import sys
 import re
 import time
 from datetime import date, datetime, timezone
@@ -11,6 +19,19 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from apify import Actor
 
 log = logging.getLogger(__name__)
+
+
+def configure_workflow_logging():
+    # Apify may configure the root logger at WARNING. Use an explicit
+    # stdout handler so workflow INFO messages are always visible.
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    log.handlers.clear()
+    log.addHandler(handler)
+
 
 SCRAPER_ACTOR = "apify/facebook-posts-scraper"
 PHOTOS_ACTOR = "apify/facebook-photos-scraper"
@@ -86,6 +107,7 @@ def canonical_post_url(url):
     """Normalize equivalent post URLs for matching Photos Scraper records.
 
     Preserve story.php query identifiers; strip tracking queries on /posts/ URLs.
+    Do not use this function for photo-viewer URLs.
     """
     if not isinstance(url, str) or not url.strip():
         return None
@@ -168,11 +190,65 @@ async def read_all_items(dataset_id):
     return records
 
 
-async def call_actor(actor_id, run_input):
+async def start_and_wait_actor(actor_id, run_input):
+    """Start once, then poll run metadata without opening a live log stream."""
     log.info("Starting Actor %s", actor_id)
-    run = await Actor.call(actor_id=actor_id, run_input=run_input)
-    if run is None:
-        raise RuntimeError(f"{actor_id} did not return a run")
+    started = await Actor.apify_client.actor(actor_id).start(run_input=run_input)
+    run_id = field(started, "id")
+    if not run_id:
+        raise RuntimeError(f"{actor_id} returned no run ID")
+    log.info("Actor %s started; run=%s", actor_id, run_id)
+    client = Actor.apify_client.run(run_id)
+    terminal = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+    previous_status = None
+    previous_message = None
+    previous_log = ""
+    failures = 0
+    while True:
+        try:
+            run = await client.get()
+            if not run:
+                raise RuntimeError("Run metadata unavailable")
+        except Exception as exc:
+            failures += 1
+            log.warning("Run %s status lookup failed (%s/6): %s", run_id, failures, exc)
+            if failures >= 6:
+                raise RuntimeError(f"Cannot retrieve status of {actor_id}; run={run_id}") from exc
+            await asyncio.sleep(min(30, 5 * failures))
+            continue
+        failures = 0
+        status = field(run, "status")
+        message = run_field(run, "status_message", "statusMessage")
+        if status != previous_status or message != previous_message:
+            log.info("Actor %s run=%s status=%s message=%s", actor_id, run_id, status, message or "")
+            previous_status = status
+            previous_message = message
+        # Fetch a finite log snapshot, never a live streaming connection.
+        # Logging is best-effort and must not invalidate a successful run.
+        try:
+            raw = await asyncio.wait_for(client.log().get(), timeout=10)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if raw:
+                if not raw.startswith(previous_log):
+                    log.warning("Actor %s run=%s log changed/truncated; replaying available snapshot", actor_id, run_id)
+                    previous_log = ""
+                if status in terminal:
+                    lines = raw[len(previous_log):].splitlines()
+                    previous_log = raw
+                else:
+                    lines, previous_log = new_log_lines(previous_log, raw)
+                for line in lines:
+                    log.info("[%s runId:%s] %s", actor_id, run_id, line)
+        except Exception as exc:
+            log.warning("Actor %s run=%s log retrieval failed (non-fatal): %s", actor_id, run_id, exc)
+        if status in terminal:
+            return run
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+async def call_actor(actor_id, run_input):
+    run = await start_and_wait_actor(actor_id, run_input)
     status = field(run, "status")
     if status != "SUCCEEDED":
         raise RuntimeError(
@@ -189,6 +265,8 @@ async def call_actor(actor_id, run_input):
 def new_log_lines(previous_text, current_text):
     """Count only newly appended *complete* lines.
 
+    Log retrieval normally returns cumulative text. When it is replaced or
+    truncated, skip the uncertain section rather than double-count blocks.
     """
     if not current_text:
         return [], current_text
@@ -243,6 +321,9 @@ async def monitored_posts_scraper(scraper_input):
     consecutive_blocks = 0
     stop_reason = None
     final_status = None
+    previous_status = None
+    previous_message = None
+    log.info("Posts Scraper started; run=%s", run_id)
 
     while True:
         run_info = await run_client.get()
@@ -251,6 +332,10 @@ async def monitored_posts_scraper(scraper_input):
         final_status = field(run_info, "status")
         dataset_id = run_field(run_info, "default_dataset_id", "defaultDatasetId") or dataset_id
 
+        message = run_field(run_info, "status_message", "statusMessage")
+        if final_status != previous_status or message != previous_message:
+            log.info("Posts Scraper run=%s status=%s message=%s", run_id, final_status, message or "")
+            previous_status, previous_message = final_status, message
         if final_status in terminal:
             stop_reason = (
                 "completed_normally" if final_status == "SUCCEEDED"
@@ -265,10 +350,12 @@ async def monitored_posts_scraper(scraper_input):
             break
 
         try:
-            raw = await run_client.log().get()
+            raw = await asyncio.wait_for(run_client.log().get(), timeout=10)
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", errors="replace")
             lines, previous_log = new_log_lines(previous_log, raw or "")
+            for line in lines:
+                log.info("[%s runId:%s] %s", SCRAPER_ACTOR, run_id, line)
             consecutive_blocks = inspect_scraper_log_lines(lines, consecutive_blocks)
         except Exception as exc:
             log.warning("Scraper log monitoring failed; will retry: %s", exc)
@@ -296,6 +383,17 @@ async def monitored_posts_scraper(scraper_input):
             dataset_id = run_field(latest, "default_dataset_id", "defaultDatasetId") or dataset_id
     except Exception as exc:
         log.warning("Could not refresh final Posts Scraper status: %s", exc)
+
+    try:
+        raw = await asyncio.wait_for(run_client.log().get(), timeout=10)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if raw:
+            tail = raw[len(previous_log):] if raw.startswith(previous_log) else raw
+            for line in tail.splitlines():
+                log.info("[%s runId:%s] %s", SCRAPER_ACTOR, run_id, line)
+    except Exception as exc:
+        log.warning("Final Posts Scraper log retrieval failed (non-fatal): %s", exc)
 
     if not dataset_id:
         raise RuntimeError(f"Posts Scraper returned no dataset ID; run={run_id}")
@@ -365,7 +463,7 @@ async def collect_photos(posts, photos_results_limit):
         "startUrls": [{"url": post["url"]} for post in posts],
     }
     try:
-        run = await Actor.call(actor_id=PHOTOS_ACTOR, run_input=photos_input)
+        run = await start_and_wait_actor(PHOTOS_ACTOR, photos_input)
         if run is None:
             raise RuntimeError("Photos Scraper returned no run")
         photos_run_id = field(run, "id")
@@ -445,6 +543,8 @@ async def collect_photos(posts, photos_results_limit):
 
 async def cache_photos(posts):
     """Fetch original bytes before screenshot runs; retain failures for reporting."""
+    total = sum(len(post["photos"]) for post in posts)
+    log.info("PHOTO CACHE: Downloading %s additional photos", total)
     semaphore = asyncio.Semaphore(10)
     store = await Actor.open_key_value_store()
     async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=10), follow_redirects=True) as client:
@@ -472,7 +572,16 @@ async def cache_photos(posts):
                         if attempt < 3:
                             await asyncio.sleep(attempt)
                 photo["downloadError"] = f"After 3 attempts: {reason}"
-        await asyncio.gather(*(fetch(post, photo) for post in posts for photo in post["photos"]))
+        completed = 0
+        async def fetch_with_progress(post, photo):
+            nonlocal completed
+            await fetch(post, photo)
+            completed += 1
+            log.info("PHOTO CACHE: %s/%s processed; photo=%s; %s", completed, total,
+                     photo["id"], "cached" if photo.get("storageKey") else "failed")
+        await asyncio.gather(*(fetch_with_progress(post, photo) for post in posts for photo in post["photos"]))
+    cached = sum(bool(photo.get("storageKey")) for post in posts for photo in post["photos"])
+    log.info("PHOTO CACHE COMPLETE: %s cached, %s failed", cached, total - cached)
 
 
 def capture_log(summary, manifest):
@@ -592,6 +701,8 @@ async def run_pdf_merger(dataset_id, manifest, page_size, max_image_height, prof
 async def main():
     print("FACEBOOK WORKFLOW: Started", flush=True)
     async with Actor:
+        configure_workflow_logging()
+        log.info("Workflow logging enabled (INFO; finite child log snapshots)")
         config = await Actor.get_input() or {}
         profile_url = validate_profile_url(config.get("facebookProfileUrl"))
         results_limit = int(config.get("resultsLimit", 20))
