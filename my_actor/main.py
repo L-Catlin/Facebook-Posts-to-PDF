@@ -1,10 +1,3 @@
-"""Facebook posts -> photo discovery -> screenshots -> ordered PDF.
-
-This version keeps the explicit monitoring, validation, intermediate artifacts,
-logging, and partial-results recovery of the original orchestrator. It adds
-photo discovery as a separate, non-fatal stage.
-"""
-
 import asyncio
 import io
 import httpx
