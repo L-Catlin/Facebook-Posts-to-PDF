@@ -1,4 +1,14 @@
+"""Facebook posts -> photo discovery -> screenshots -> ordered PDF.
+
+This version keeps the explicit monitoring, validation, intermediate artifacts,
+logging, and partial-results recovery of the original orchestrator. It adds
+photo discovery as a separate, non-fatal stage.
+"""
+
 import asyncio
+import io
+import httpx
+from PIL import Image
 import logging
 import re
 import time
@@ -390,13 +400,14 @@ async def collect_photos(posts, photos_results_limit):
         if parent not in by_url or not pid:
             unmatched += 1
             continue
+        if row.get("dataType") == "video":
+            continue
         image_url = direct_image_url(row)
         if not image_url:
             missing_images += 1
-            continue
         if pid not in seen[parent]:
             seen[parent].add(pid)
-            discovered[parent].append({"id": pid, "imageUrl": image_url})
+            discovered[parent].append({"id": pid, "imageUrl": image_url, "photoUrl": (row.get("creation_story") or {}).get("url") or f"https://www.facebook.com/photo/?fbid={pid}"})
 
     skipped_previews = 0
     for post in posts:
@@ -442,6 +453,63 @@ async def collect_photos(posts, photos_results_limit):
 # Manifest and screenshot stages
 # ------------------------------------------------------------
 
+async def cache_photos(posts):
+    """Fetch original bytes before screenshot runs; retain failures for reporting."""
+    semaphore = asyncio.Semaphore(10)
+    store = await Actor.open_key_value_store()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=10), follow_redirects=True) as client:
+        async def fetch(post, photo):
+            url = photo.get("imageUrl")
+            if not url:
+                photo["downloadError"] = "Photos Scraper returned no image URL"
+                return
+            async with semaphore:
+                for attempt in range(1, 4):
+                    try:
+                        response = await client.get(url)
+                        response.raise_for_status()
+                        data = response.content
+                        with Image.open(io.BytesIO(data)) as image:
+                            image.load()
+                        key = f"PHOTO-{photo['id']}.bin"
+                        await store.set_value(key, data, content_type="application/octet-stream")
+                        photo["storageKey"] = key
+                        photo["storageId"] = store.id
+                        return
+                    except Exception as exc:
+                        reason = f"{type(exc).__name__}: {str(exc).split('?')[0]}"
+                        log.warning("Photo %s host=%s attempt %s/3: %s", photo['id'], urlparse(url).hostname, attempt, reason)
+                        if attempt < 3:
+                            await asyncio.sleep(attempt)
+                photo["downloadError"] = f"After 3 attempts: {reason}"
+        await asyncio.gather(*(fetch(post, photo) for post in posts for photo in post["photos"]))
+
+
+def capture_log(summary, manifest):
+    merger = summary.get("pdfSummary") or {}
+    failures = merger.get("skipped") or []
+    photos = [x for x in failures if x.get("kind") == "photo"]
+    groups = {}
+    for item in photos:
+        groups.setdefault(item["url"], []).append(item)
+    included = merger.get("included") or []
+    discovery = summary.get("photosScraper") or {}
+    uncertain = discovery.get("status") != "SUCCEEDED" or discovery.get("unmatchedRows", 0) or discovery.get("rowsReturned", 0) >= discovery.get("resultsLimit", float("inf"))
+    lines = ["FACEBOOK REPORT — CAPTURE LOG", "", f"{len(groups)} posts with a total of {len(photos)} failed photos.", f"Other missing report entries: {len(failures)-len(photos)}", "", "Status: " + ("COMPLETED WITH KNOWN OMISSIONS OR DISCOVERY WARNINGS" if failures or uncertain else "COMPLETED — NO KNOWN CAPTURE FAILURES"), "", "Counts cover discovered report entries only; undiscovered photos cannot be counted."]
+    if uncertain:
+        lines += ["", f"Discovery warning: status={discovery.get('status')}; rows={discovery.get('rowsReturned')}; limit={discovery.get('resultsLimit')}; unmatched={discovery.get('unmatchedRows')}. Review the source posts manually."]
+    for url, items in groups.items():
+        parent = next((x for x in included if x.get("kind") == "post" and x.get("url") == url), None)
+        related = [x["page"] for x in included if x.get("url") == url]
+        lines += ["", "="*60, f"Post URL: {url}", f"Parent report page: {parent['page'] if parent else 'not included'}", f"Insert after report page: {max(related) if related else 'locate by post order'} (original page numbering)", f"Missing photos: {len(items)}"]
+        for item in items:
+            lines += ["", f"Photo ID: {item.get('photoId', 'unknown')}", f"Photo URL: {item.get('photoUrl') or 'unavailable'}", f"Failure: {item.get('error')}"]
+    for item in failures:
+        if item.get("kind") != "photo":
+            lines += ["", f"Missing {item.get('kind')}: {item.get('url')}", f"Failure: {item.get('error')}"]
+    return "\n".join(lines) + "\n"
+
+
 def build_manifest(posts, profile_url):
     """Order: post screenshot, its extra original images, next post, ..."""
     manifest = [{"kind": "profile", "url": profile_url}]
@@ -453,7 +521,7 @@ def build_manifest(posts, profile_url):
             manifest.append({
                 "kind": "photo", "postNumber": number,
                 "photoId": photo["id"], "url": post["url"],
-                "imageUrl": photo["imageUrl"]
+                **{k: photo[k] for k in ("imageUrl", "photoUrl", "storageKey", "storageId", "downloadError") if photo.get(k)}
             })
     return manifest
 
@@ -509,18 +577,21 @@ async def run_pdf_merger(dataset_id, manifest, page_size, max_image_height, prof
     if not store_id:
         raise RuntimeError("PDF merger returned no key-value store ID")
     store = Actor.apify_client.key_value_store(store_id)
-    record = await store.get_record("facebook-posts.pdf")
-    if not record:
-        raise RuntimeError("PDF merger completed but facebook-posts.pdf was not found")
-    pdf_bytes = field(record, "value")
-    if isinstance(pdf_bytes, bytearray):
-        pdf_bytes = bytes(pdf_bytes)
-    if not isinstance(pdf_bytes, bytes):
-        raise RuntimeError("PDF record did not contain binary PDF data")
-    await Actor.set_value("facebook-posts.pdf", pdf_bytes, content_type="application/pdf")
+    for key, content_type in (
+        ("facebook-posts.pdf", "application/pdf"),
+        ("facebook-posts.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ):
+        record = await store.get_record(key)
+        value = field(record, "value") if record else None
+        if isinstance(value, bytearray):
+            value = bytes(value)
+        if not isinstance(value, bytes) or not value:
+            raise RuntimeError(f"Report merger returned no binary {key}")
+        await Actor.set_value(key, value, content_type=content_type)
+        log.info("Saved %s (%s bytes)", key, len(value))
     summary_record = await store.get_record("SUMMARY")
     merger_summary = field(summary_record, "value") if summary_record else None
-    log.info("STEP 4 COMPLETE: PDF saved (%s bytes)", len(pdf_bytes))
+    log.info("STEP 4 COMPLETE: PDF and DOCX saved")
     return run, merger_summary
 
 
@@ -575,6 +646,7 @@ async def main():
         })
 
         photos_info = await collect_photos(posts, photos_results_limit)
+        await cache_photos(posts)
         manifest = build_manifest(posts, profile_url)
         await Actor.set_value("REPORT_MANIFEST", {
             "profileUrl": profile_url,
@@ -616,9 +688,13 @@ async def main():
             "screenshotRunId": field(screenshot_run, "id"),
             "mergerRunId": field(merger_run, "id"),
             "pdfKey": "facebook-posts.pdf",
+            "docxKey": "facebook-posts.docx",
             "pdfSummary": merger_summary,
             "generatedAt": datetime.now(timezone.utc).isoformat(),
         }
+        summary["additionalPhotosIncluded"] = sum(x.get("kind") == "photo" for x in (merger_summary or {}).get("included", []))
+        summary["logsKey"] = "REPORT_LOGS.txt"
+        await Actor.set_value("REPORT_LOGS.txt", capture_log(summary, manifest), content_type="text/plain; charset=utf-8")
         await Actor.set_value("SUMMARY", summary)
         await Actor.push_data(summary)
         log.info(
